@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Camera → Phone Number OCR (Tesseract.js)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; margin: 12px; color:#111; }
+    h1 { font-size: 18px; margin-bottom: 6px; }
+    #container { display: grid; grid-template-columns: 1fr 320px; gap: 12px; align-items:start; }
+    #videoWrap { position: relative; border-radius:8px; overflow:hidden; background:#000; }
+    video { width:100%; height:auto; display:block; transform:scaleX(-1); /* mirror */ }
+    canvas#processCanvas { display:none; } /* offscreen processing */
+    .overlay {
+      position:absolute; left:8px; top:8px; background:rgba(0,0,0,0.45); color:#fff;
+      padding:6px 8px; border-radius:6px; font-size:13px;
+    }
+    .controls { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+    button { padding:8px 10px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+    button.secondary { background:#f5f5f5; }
+    #rightPanel { border:1px solid #e6e6e6; padding:12px; border-radius:8px; min-height: 240px; }
+    #foundList { margin-top:10px; display:block; gap:6px; }
+    .phoneItem { display:flex; justify-content:space-between; align-items:center; padding:8px; border-radius:6px; background:#fafafa; border:1px solid #eee; margin-bottom:6px; }
+    .phoneText { font-weight:600; letter-spacing:0.3px; }
+    .small { font-size:13px; color:#666; margin-top:8px; }
+    #status { font-size:13px; color:#444; margin-top:6px; }
+    #loader { display:inline-block; width:12px; height:12px; border:2px solid #ccc; border-top-color:#333; border-radius:50%; animation:spin 1s linear infinite; margin-right:8px; vertical-align:middle;}
+    @keyframes spin { to { transform:rotate(360deg) } }
+    input[type=checkbox] { transform:scale(1.1); margin-right:6px; }
+    footer { margin-top:12px; font-size:12px; color:#666; }
+    .copyBtn { padding:6px 8px; font-size:13px; }
+  </style>
+  <!-- Tesseract.js CDN -->
+  <script src="https://unpkg.com/tesseract.js@v4.1.1/dist/tesseract.min.js"></script>
+</head>
+<body>
+  <h1>Camera → Phone Number OCR</h1>
+  <div id="container">
+    <div>
+      <div id="videoWrap">
+        <video id="video" autoplay playsinline></video>
+        <div class="overlay" id="overlayText">Initializing camera…</div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" class="secondary" disabled>Stop</button>
+        <button id="oneShotBtn" class="secondary">One-shot OCR</button>
+        <label style="display:inline-flex;align-items:center;">
+          <input type="checkbox" id="onlyUnique" checked /> Unique only
+        </label>
+        <label style="display:inline-flex;align-items:center;">
+          <input type="checkbox" id="autoCopy" /> Auto copy
+        </label>
+        <label style="display:inline-flex;align-items:center;">
+          <input type="checkbox" id="fastMode" /> Fast (less accurate)
+        </label>
+      </div>
+
+      <canvas id="processCanvas"></canvas>
+      <div id="status" class="small">Tesseract worker not ready.</div>
+    </div>
+
+    <div id="rightPanel">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>Detected phone numbers</strong>
+        <div>
+          <button id="clearBtn" class="secondary">Clear</button>
+        </div>
+      </div>
+
+      <div id="foundList" aria-live="polite"></div>
+
+      <div class="small">
+        Tips: point the camera at text with a phone number. Good lighting and steady framing improves results. This runs OCR entirely in the browser (offline).
+      </div>
+      <div style="margin-top:10px;">
+        <button id="copyAll" class="copyBtn">Copy all</button>
+        <button id="download" class="copyBtn">Download .txt</button>
+      </div>
+    </div>
+  </div>
+
+  <footer>Requires a secure context (HTTPS) on mobile. Works best in Chrome/Edge/Firefox.</footer>
+
+<script>
+(async () => {
+  const video = document.getElementById('video');
+  const processCanvas = document.getElementById('processCanvas');
+  const overlayText = document.getElementById('overlayText');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const oneShotBtn = document.getElementById('oneShotBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const foundList = document.getElementById('foundList');
+  const statusEl = document.getElementById('status');
+  const copyAllBtn = document.getElementById('copyAll');
+  const downloadBtn = document.getElementById('download');
+  const onlyUnique = document.getElementById('onlyUnique');
+  const autoCopy = document.getElementById('autoCopy');
+  const fastMode = document.getElementById('fastMode');
+
+  let stream = null;
+  let scanning = false;
+  let scanIntervalId = null;
+  let worker = null;
+  let detectedPhones = []; // array of strings
+
+  // Phone regex (covers many common formats, plus optional country code)
+  const phoneRegex = /(?:\+?\d{1,3}[\s-.]*)?(?:\(?\d{3}\)?[\s-.\u00A0]?){1}\d{3}[\s-.\u00A0]?\d{4}/g;
+
+  // Utilities
+  function normalizePhone(s) {
+    // trim, convert multiple spaces to single, remove non-essential punctuation
+    return s.replace(/\u00A0/g,' ').trim();
+  }
+  function addPhoneIfNew(p) {
+    p = normalizePhone(p);
+    if (onlyUnique.checked) {
+      if (!detectedPhones.includes(p)) detectedPhones.push(p);
+    } else {
+      detectedPhones.push(p);
+    }
+    renderList();
+    if (autoCopy.checked) copyToClipboard(detectedPhones.join('\n'));
+  }
+  function renderList() {
+    foundList.innerHTML = '';
+    if (detectedPhones.length === 0) {
+      foundList.innerHTML = '<div class="small">No phone numbers found yet.</div>';
+      return;
+    }
+    detectedPhones.forEach((p, idx) => {
+      const div = document.createElement('div');
+      div.className = 'phoneItem';
+      div.innerHTML = `<span class="phoneText">${escapeHtml(p)}</span>
+        <div style="display:flex;gap:8px">
+          <button class="copyBtn" data-idx="${idx}">Copy</button>
+          <button class="copyBtn" data-del="${idx}">Delete</button>
+        </div>`;
+      foundList.appendChild(div);
+    });
+  }
+  function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  async function copyToClipboard(text) {
+    try { await navigator.clipboard.writeText(text); overlayOnce('Copied to clipboard'); }
+    catch(e){ overlayOnce('Copy failed'); }
+  }
+  function overlayOnce(msg, timeout=1400) {
+    const prev = overlayText.textContent;
+    overlayText.textContent = msg;
+    setTimeout(()=> overlayText.textContent = prev, timeout);
+  }
+
+  // Initialize Tesseract worker
+  async function createWorker() {
+    statusEl.innerHTML = '<span id="loader"></span>Loading OCR engine...';
+    worker = Tesseract.createWorker({
+      logger: m => {
+        // optional progress logs
+        if (m && m.status) {
+          if (m.status === 'recognizing text' && m.progress) {
+            statusEl.innerText = `Recognizing text — ${(m.progress*100).toFixed(0)}%`;
+          }
+        }
+      }
+    });
+    await worker.load();
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+    // use fast config if desired
+    statusEl.innerText = 'OCR ready';
+  }
+
+  // Camera helpers
+  async function startCamera() {
+    if (stream) return;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+      overlayText.textContent = 'Point camera at text containing a phone number';
+      // size canvas to video
+      processCanvas.width = video.videoWidth;
+      processCanvas.height = video.videoHeight;
+    } catch (err) {
+      overlayText.textContent = 'Camera failed: ' + (err.message || err);
+      console.error(err);
+    }
+  }
+  function stopCamera() {
+    if (!stream) return;
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.pause();
+    video.srcObject = null;
+    overlayText.textContent = 'Camera stopped';
+  }
+
+  // Do OCR on current frame
+  async function doOcrOnce() {
+    if (!worker) {
+      overlayOnce('OCR engine not ready');
+      return;
+    }
+    if (!video || video.readyState < 2) {
+      overlayOnce('Camera not ready');
+      return;
+    }
+
+    // Draw frame to canvas
+    const ctx = processCanvas.getContext('2d');
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    processCanvas.width = w;
+    processCanvas.height = h;
+
+    // Optionally crop a center region to speed up / focus:
+    // For full-frame, use the whole video. For speed, crop center 75%
+    let sx = 0, sy = 0, sw = w, sh = h;
+    // small speed option: crop center 75% both dims
+    if (fastMode.checked) {
+      sw = Math.floor(w * 0.75);
+      sh = Math.floor(h * 0.75);
+      sx = Math.floor((w - sw) / 2);
+      sy = Math.floor((h - sh) / 2);
+    }
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    // Optional simple preprocessing: convert to grayscale & increase contrast
+    let imgData = ctx.getImageData(0,0,sw,sh);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      // grayscale
+      const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+      // simple contrast/stretch
+      const c = Math.min(255, Math.max(0, (gray - 100) * 1.6 + 100));
+      d[i] = d[i+1] = d[i+2] = c;
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    overlayText.textContent = 'Running OCR...';
+    // Run tesseract on the canvas element (faster than dataURL conversion)
+    const { data: { text } } = await worker.recognize(processCanvas);
+    overlayText.textContent = 'Listening for phone numbers...';
+    if (text && text.trim().length > 0) {
+      const matches = text.match(phoneRegex) || [];
+      if (matches.length > 0) {
+        matches.forEach(m => addPhoneIfNew(m.trim()));
+      }
+    }
+  }
+
+  // Continuous scanning
+  function startScanning() {
+    if (scanning) return;
+    scanning = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    // run OCR every N ms (balance accuracy/perf)
+    const intervalMs = fastMode.checked ? 800 : 1400;
+    scanIntervalId = setInterval(() => {
+      // don't overlap calls: ensure previous OCR finished by awaiting inside doOcrOnce
+      // We'll track with a promise flag
+      if (!doOcrOnce._running) {
+        doOcrOnce._running = true;
+        doOcrOnce().finally(()=> doOcrOnce._running = false);
+      }
+    }, intervalMs);
+  }
+
+  function stopScanning() {
+    scanning = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (scanIntervalId) {
+      clearInterval(scanIntervalId);
+      scanIntervalId = null;
+    }
+    overlayText.textContent = 'Scanning stopped';
+  }
+
+  // UI wiring
+  startBtn.addEventListener('click', async () => {
+    await startCamera();
+    if (!worker) await createWorker();
+    startScanning();
+  });
+  stopBtn.addEventListener('click', () => {
+    stopScanning();
+    stopCamera();
+  });
+  oneShotBtn.addEventListener('click', async () => {
+    if (!stream) await startCamera();
+    if (!worker) await createWorker();
+    await doOcrOnce();
+  });
+  clearBtn.addEventListener('click', () => {
+    detectedPhones = [];
+    renderList();
+  });
+  copyAllBtn.addEventListener('click', async () => {
+    if (detectedPhones.length === 0) { overlayOnce('Nothing to copy'); return; }
+    await copyToClipboard(detectedPhones.join('\n'));
+  });
+  downloadBtn.addEventListener('click', () => {
+    const content = detectedPhones.join('\n');
+    const blob = new Blob([content], {type: 'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'phones.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // Delegate copy/delete buttons in list
+  foundList.addEventListener('click', (e) => {
+    const c = e.target;
+    if (c.matches('button[data-idx]')) {
+      const idx = Number(c.dataset.idx);
+      copyToClipboard(detectedPhones[idx]);
+    } else if (c.matches('button[data-del]')) {
+      const idx = Number(c.dataset.del);
+      detectedPhones.splice(idx,1);
+      renderList();
+    }
+  });
+
+  // Escape hatch: when page hidden, stop scanning to save battery
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (scanning) { stopScanning(); overlayText.textContent = 'Paused (tab hidden)'; }
+    } else {
+      overlayText.textContent = 'Resume when ready';
+    }
+  });
+
+  // initial render
+  renderList();
+
+  // cleanup on unload
+  window.addEventListener('beforeunload', () => {
+    stopScanning();
+    stopCamera();
+    if (worker) worker.terminate && worker.terminate();
+  });
+
+  // small helper: auto-start camera if the page is loaded on desktop? (commented out)
+  // await startCamera();
+
+})();
+</script>
+</body>
+</html>
